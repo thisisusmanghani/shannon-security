@@ -1,0 +1,48 @@
+# Shannon Security Analysis Configuration for AnyLead Auth Module
+
+authentication:
+  login_type: form
+  login_url: "http://localhost:3000/api/auth/login"
+  credentials:
+    username: "test@example.com"
+    password: "TestPassword123!"
+  
+  # Login flow for API-based authentication
+  login_flow:
+    - "Send POST request to /api/auth/login with email and password"
+    - "Extract access_token from response"
+    - "Use token in Authorization header as 'Bearer <token>'"
+  
+  success_condition:
+    type: element_present
+    value: "token"
+
+rules:
+  focus:
+    - description: "Focus on authentication endpoints"
+      type: path
+      url_path: "/api/auth/*"
+    
+    - description: "Test protected routes"
+      type: path
+      url_path: "/api/protected"
+    
+    - description: "Test authorization bypass"
+      type: path
+      url_path: "/api/*"
+
+  avoid:
+    - description: "Skip health check endpoint"
+      type: path
+      url_path: "/api/health"
+
+# Specific security tests to prioritize
+security_focus:
+  - "Authentication bypass vulnerabilities"
+  - "JWT token manipulation"
+  - "SQL injection in login/signup"
+  - "Broken access control"
+  - "Session fixation"
+  - "OTP brute force protection"
+  - "RBAC authorization issues"
+  - "Token expiration and refresh vulnerabilities"

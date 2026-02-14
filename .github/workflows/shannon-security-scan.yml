@@ -1,0 +1,242 @@
+name: Shannon Security Scan
+
+on:
+  # Run on push to main/master
+  push:
+    branches: [ main, master ]
+  
+  # Run on pull requests
+  pull_request:
+    branches: [ main, master ]
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL to scan (e.g., https://your-app.com)'
+        required: true
+        default: 'http://localhost:3000'
+      config_file:
+        description: 'Config file path (relative to configs/)'
+        required: false
+        default: 'anylead-auth-config.yaml'
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+jobs:
+  shannon-pentest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hour max
+    
+    steps:
+      - name: 📥 Checkout Shannon
+        uses: actions/checkout@v4
+        with:
+          repository: KeygraphHQ/shannon
+          path: shannon
+      
+      - name: 📥 Checkout Your Code for Analysis
+        uses: actions/checkout@v4
+        with:
+          path: shannon/repos/anylead
+      
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 🔍 Check Docker Space
+        run: |
+          df -h
+          docker system df
+      
+      - name: 📋 Create Shannon Config
+        run: |
+          cd shannon
+          cat > configs/anylead-auth-config.yaml << 'EOF'
+          authentication:
+            login_type: form
+            login_url: "${{ github.event.inputs.target_url || 'http://localhost:3000' }}/api/auth/login"
+            credentials:
+              username: "test@example.com"
+              password: "TestPassword123!"
+            
+            login_flow:
+              - "Send POST request to /api/auth/login with email and password"
+              - "Extract access_token from response"
+              - "Use token in Authorization header as 'Bearer <token>'"
+            
+            success_condition:
+              type: element_present
+              value: "token"
+
+          rules:
+            focus:
+              - description: "Focus on authentication endpoints"
+                type: path
+                url_path: "/api/auth/*"
+              
+              - description: "Test protected routes"
+                type: path
+                url_path: "/api/protected"
+
+            avoid:
+              - description: "Skip health check endpoint"
+                type: path
+                url_path: "/api/health"
+          EOF
+      
+      - name: 🚀 Start Application (if needed)
+        working-directory: shannon/repos/anylead
+        run: |
+          # Check if we need to start the app locally
+          if [[ "${{ github.event.inputs.target_url }}" == *"localhost"* ]] || [[ -z "${{ github.event.inputs.target_url }}" ]]; then
+            echo "Starting application locally for testing..."
+            
+            # Install dependencies if package.json exists
+            if [ -f "package.json" ]; then
+              npm install || echo "No npm dependencies to install"
+            fi
+            
+            # Start backend if it exists
+            if [ -f "Developments/anylead-backend/package.json" ]; then
+              cd Developments/anylead-backend
+              npm install
+              npm run build || true
+              npm start &
+              BACKEND_PID=$!
+              echo "BACKEND_PID=$BACKEND_PID" >> $GITHUB_ENV
+              
+              # Wait for backend to start
+              sleep 10
+              
+              # Health check
+              curl -f http://localhost:3000/api/health || echo "Backend may not be ready yet"
+            fi
+          else
+            echo "Using external target: ${{ github.event.inputs.target_url }}"
+          fi
+        continue-on-error: true
+      
+      - name: 🔒 Run Shannon Security Scan
+        working-directory: shannon
+        run: |
+          chmod +x shannon
+          
+          # Start Shannon
+          CONFIG_FILE="${{ github.event.inputs.config_file || 'anylead-auth-config.yaml' }}"
+          TARGET_URL="${{ github.event.inputs.target_url || 'http://localhost:3000' }}"
+          
+          echo "🎯 Starting Shannon pentest..."
+          echo "Target: $TARGET_URL"
+          echo "Config: $CONFIG_FILE"
+          
+          ./shannon start URL="$TARGET_URL" REPO=anylead CONFIG="./configs/$CONFIG_FILE" &
+          SHANNON_PID=$!
+          
+          # Monitor Shannon logs
+          sleep 5
+          ./shannon logs &
+          
+          # Wait for Shannon to complete (or timeout)
+          wait $SHANNON_PID || echo "Shannon completed with exit code: $?"
+        timeout-minutes: 90
+        continue-on-error: true
+      
+      - name: 📊 Collect Shannon Results
+        if: always()
+        run: |
+          cd shannon
+          
+          # Check for audit logs
+          if [ -d "audit-logs" ]; then
+            echo "✅ Shannon audit logs found"
+            ls -la audit-logs/
+            
+            # Find the latest report
+            LATEST_REPORT=$(find audit-logs -name "*.md" -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)
+            
+            if [ -n "$LATEST_REPORT" ]; then
+              echo "📄 Latest report: $LATEST_REPORT"
+              echo "REPORT_PATH=$LATEST_REPORT" >> $GITHUB_ENV
+              
+              # Show summary
+              head -100 "$LATEST_REPORT"
+            fi
+          else
+            echo "⚠️ No audit logs found"
+          fi
+      
+      - name: 📤 Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shannon-security-report-${{ github.run_number }}
+          path: |
+            shannon/audit-logs/
+            shannon/*.log
+          retention-days: 90
+          if-no-files-found: warn
+      
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          cd shannon
+          ./shannon stop CLEAN=true || true
+          
+          # Kill backend if started
+          if [ -n "$BACKEND_PID" ]; then
+            kill $BACKEND_PID 2>/dev/null || true
+          fi
+      
+      - name: 📊 Security Summary
+        if: always()
+        run: |
+          echo "## 🔒 Shannon Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ github.event.inputs.target_url || 'http://localhost:3000' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Date:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$REPORT_PATH" ] && [ -f "shannon/$REPORT_PATH" ]; then
+            echo "### 📄 Report Preview" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -200 "shannon/$REPORT_PATH" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No report generated. Check logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 Download full report from Artifacts section above" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 💬 Comment PR with Results (if PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Find latest report
+            const auditDir = 'shannon/audit-logs';
+            if (fs.existsSync(auditDir)) {
+              const files = fs.readdirSync(auditDir)
+                .filter(f => f.endsWith('.md'))
+                .map(f => ({ name: f, path: path.join(auditDir, f) }));
+              
+              if (files.length > 0) {
+                const latestReport = files[0];
+                const report = fs.readFileSync(latestReport.path, 'utf8');
+                const preview = report.substring(0, 5000); // First 5000 chars
+                
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: `## 🔒 Shannon Security Scan Results\n\n${preview}\n\n... [Download full report from Actions artifacts]`
+                });
+              }
+            }

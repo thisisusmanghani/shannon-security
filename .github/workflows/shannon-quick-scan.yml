@@ -1,0 +1,59 @@
+name: Shannon Quick Scan (Lite)
+
+# Lightweight version for faster scans with resource constraints
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL'
+        required: true
+        default: 'https://your-production-site.com'
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000  # Reduced for quicker scans
+
+jobs:
+  quick-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: 📥 Checkout Shannon
+        uses: actions/checkout@v4
+        with:
+          repository: KeygraphHQ/shannon
+          path: shannon
+      
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          path: shannon/repos/target
+      
+      - name: 🔍 Quick Security Scan
+        working-directory: shannon
+        run: |
+          chmod +x shannon
+          
+          # Minimal config for quick scan
+          cat > configs/quick-scan.yaml << 'EOF'
+          rules:
+            focus:
+              - description: "Auth endpoints"
+                type: path
+                url_path: "/api/auth/*"
+          EOF
+          
+          # Run quick scan
+          ./shannon start URL="${{ github.event.inputs.target_url }}" REPO=target CONFIG=./configs/quick-scan.yaml || true
+          
+          # Collect logs
+          ./shannon logs
+      
+      - name: 📤 Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-scan-results
+          path: shannon/audit-logs/
+          retention-days: 30
