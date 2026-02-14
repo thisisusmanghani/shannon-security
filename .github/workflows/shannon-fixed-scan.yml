@@ -1,0 +1,145 @@
+name: Shannon Fixed Scan (Proper Monitoring)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL (with ngrok or public endpoint)'
+        required: true
+        default: 'https://precisely-unguttural-hal.ngrok-free.dev'
+      config_file:
+        description: 'Config file name in configs/'
+        required: false
+        default: 'anylead-auth-config.yaml'
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+jobs:
+  shannon-pentest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hours max
+    
+    steps:
+      - name: 📥 Checkout Shannon
+        uses: actions/checkout@v4
+        with:
+          repository: KeygraphHQ/shannon
+          path: shannon
+      
+      - name: 📥 Checkout Target Code
+        uses: actions/checkout@v4
+        with:
+          path: shannon/repos/anylead
+      
+      - name: 🔒 Run Shannon Security Scan (Fixed)
+        working-directory: shannon
+        run: |
+          chmod +x shannon
+          
+          CONFIG_FILE="${{ github.event.inputs.config_file }}"
+          TARGET_URL="${{ github.event.inputs.target_url }}"
+          
+          echo "🎯 Starting Shannon pentest..."
+          echo "Target: $TARGET_URL"
+          echo "Config: $CONFIG_FILE"
+          
+          # Start Shannon and capture output
+          ./shannon start URL="$TARGET_URL" REPO=anylead CONFIG="./configs/$CONFIG_FILE" 2>&1 | tee shannon-start.log
+          
+          # Extract workflow ID from output
+          WORKFLOW_ID=$(grep -oP 'ID=\K[^\s]+' shannon-start.log || echo "")
+          
+          if [ -z "$WORKFLOW_ID" ]; then
+            echo "❌ Failed to get workflow ID from Shannon output"
+            echo "📄 Shannon output:"
+            cat shannon-start.log
+            exit 1
+          fi
+          
+          echo "✅ Shannon workflow started: $WORKFLOW_ID"
+          echo "📊 Monitoring progress..."
+          
+          # Monitor Shannon progress by checking session file
+          SESSION_FILE="./audit-logs/${WORKFLOW_ID}/session.json"
+          MAX_WAIT=7200  # 2 hours in seconds
+          ELAPSED=0
+          SLEEP_INTERVAL=30
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            if [ -f "$SESSION_FILE" ]; then
+              STATUS=$(jq -r '.session.status // "unknown"' "$SESSION_FILE" 2>/dev/null)
+              COST=$(jq -r '.metrics.total_cost_usd // 0' "$SESSION_FILE" 2>/dev/null)
+              DURATION=$(jq -r '.metrics.total_duration_ms // 0' "$SESSION_FILE" 2>/dev/null)
+              
+              echo "[$(date '+%H:%M:%S')] Status: $STATUS | Cost: \$${COST} | Duration: ${DURATION}ms"
+              
+              # Check if completed
+              if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ]; then
+                echo "✅ Shannon scan finished with status: $STATUS"
+                break
+              fi
+            else
+              echo "[$(date '+%H:%M:%S')] Waiting for session file to be created..."
+            fi
+            
+            sleep $SLEEP_INTERVAL
+            ELAPSED=$((ELAPSED + SLEEP_INTERVAL))
+          done
+          
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "⚠️ Timeout reached after 2 hours"
+          fi
+          
+          # Show final results
+          echo ""
+          echo "==================== FINAL RESULTS ===================="
+          if [ -f "$SESSION_FILE" ]; then
+            echo "📊 Session Summary:"
+            jq '.' "$SESSION_FILE"
+          fi
+          
+          # List all generated reports
+          echo ""
+          echo "📄 Generated Files:"
+          find ./audit-logs -type f -ls
+          
+        timeout-minutes: 120
+        continue-on-error: true
+      
+      - name: 📤 Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shannon-security-report-fixed
+          path: |
+            shannon/audit-logs/
+            shannon/shannon-start.log
+          retention-days: 90
+          if-no-files-found: warn
+      
+      - name: 📋 Scan Summary
+        if: always()
+        run: |
+          cd shannon
+          echo "## Shannon Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "audit-logs" ]; then
+            REPORT_COUNT=$(find audit-logs -name "*.md" -type f | wc -l)
+            JSON_COUNT=$(find audit-logs -name "*.json" -type f | wc -l)
+            
+            echo "✅ Files generated: $REPORT_COUNT reports, $JSON_COUNT JSON files" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Find and display the main report
+            MAIN_REPORT=$(find audit-logs -name "*report*.md" -type f | head -1)
+            if [ -n "$MAIN_REPORT" ]; then
+              echo "### Security Report Preview" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              head -50 "$MAIN_REPORT" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ No audit logs generated" >> $GITHUB_STEP_SUMMARY
+          fi
